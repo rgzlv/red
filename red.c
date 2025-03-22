@@ -16,9 +16,9 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define CTRL(k) ((k) & 0x1f)
 
-char	*ttbuf;
-size_t	 ttbufsz;
-size_t	 ttbufpos;
+char	*ttbp;
+size_t	 ttbsz;
+size_t	 ttbpos;
 
 int	srows;
 int	scols;
@@ -26,29 +26,33 @@ int	scols;
 struct termios	ios;
 int		tty;
 
-static void	display(void);
-static void	ttmove(int, int);
-static void	tteeol(void);
-static void	tteeop(void);
-static void	ttprintf(const char *, ...);
-static void	ttputs(const char *);
-static void	ttputc(char);
-static void	ttflush(void);
-static void	fini(void);
-static int	setios(int);
+static void 	display(void);
+static void 	ttmove(int, int);
+static void 	tteeol(void);
+static void 	tteeop(void);
+static void 	tttidy(void);
+static void 	ttprintf(const char *, ...);
+static void 	ttputs(const char *);
+static void 	ttputc(char);
+static void 	ttflush(void);
+static int 	ttopen(const char *);
+static void	ttclose(void);
+static int 	ttios(int);
+static void 	panic(const char *, ...);
+static void 	fini(void);
 
 void
 display(void)
 {
 	tteeop();
-	ttmove(0, 0);
+	ttmove(1, 1);
 	ttflush();
 }
 
 void
 ttmove(int row, int col)
 {
-	ttprintf("\x1b[%d;%dH", row + 1, col + 1);
+	ttprintf("\x1b[%d;%dH", row, col);
 }
 
 void
@@ -64,6 +68,14 @@ tteeop(void)
 }
 
 void
+tttidy(void)
+{
+	ttmove(srows, 0);
+	tteeol();
+	ttflush();
+}
+
+void
 ttprintf(const char *fmt, ...)
 {
 	va_list ap;
@@ -73,10 +85,10 @@ ttprintf(const char *fmt, ...)
 	va_start(ap, fmt);
 	sz = vsprintf(s, fmt, ap);
 	va_end(ap);
-	if (ttbufpos + sz > ttbufsz)
+	if (ttbpos + sz > ttbsz)
 		ttflush();
-	memcpy(ttbuf + ttbufpos, s, sz);
-	ttbufpos += sz;
+	memcpy(ttbp + ttbpos, s, sz);
+	ttbpos += sz;
 }
 
 void
@@ -85,79 +97,129 @@ ttputs(const char *s)
 	size_t sz;
 	
 	sz = strlen(s);
-	if (ttbufpos + sz > ttbufsz)
+	if (ttbpos + sz > ttbsz)
 		ttflush();
-	memcpy(ttbuf + ttbufpos, s, sz);
-	ttbufpos += sz;
+	memcpy(ttbp + ttbpos, s, sz);
+	ttbpos += sz;
 }
 
 void
 ttputc(char c)
 {
-	if (ttbufpos >= ttbufsz) ttflush();
-	ttbuf[ttbufpos++] = c;
+	if (ttbpos >= ttbsz) ttflush();
+	ttbp[ttbpos++] = c;
 }
 
 void
 ttflush(void)
 {
-	write(1, ttbuf, MIN(ttbufpos, ttbufsz));
-	ttbufpos = 0;
-}
-
-void
-fini(void)
-{
-	setios(0);
+	write(1, ttbp, MIN(ttbpos, ttbsz));
+	ttbpos = 0;
 }
 
 int
-setios(int raw)
+ttopen(const char *path)
 {
-	struct termios *p = &ios, rawios;
-
-	if (raw) {
-		if (tcgetattr(tty, &ios) == -1) return -1;
-		rawios = ios;
-		rawios.c_lflag &= ~(ICANON | ECHO);
-		rawios.c_iflag &= ~(IXON);
-		p = &rawios;
-	}
-	if (tcsetattr(tty, TCSANOW, p) == -1) return -1;
-	return 0;
-}
-
-int
-main(void)
-{
-	int i = 0;
 	char *ssrows, *sscols;
 
-	errno = 0;
-
-	tty = open("/dev/tty", O_RDWR);
+	tty = open(path, O_RDWR);
 	if (tty == -1)
-		err(1, "/dev/tty");
-	if (setios(1) == -1)
-		err(1, "can't set tty settings");
-	atexit(fini);
-
+		return -1;
+	if (ttios(1) == -1)
+		return -1;
 	srows = strtol((ssrows = getenv("LINES")) ? ssrows : "", NULL, 10);
 	scols = strtol((sscols = getenv("COLUMNS")) ? sscols : "", NULL, 10);
 	if (!srows || !scols) {
 		srows = 24;
 		scols = 80;
 	}
-	ttbufsz = (srows * scols) * 2;
-	ttbuf = malloc(ttbufsz);
-	if (!ttbuf)
-		err(1, NULL);
+	ttbsz = (srows * scols) * 2;
+	ttbp = malloc(ttbsz);
+	if (!ttbp)
+		panic(NULL);
+	return tty;
+}
+
+void
+ttclose()
+{
+	if (ttios(0) == -1)
+		panic("ttclose: ttios");
+	close(tty);
+	tty = 0;
+}
+
+int
+ttios(int raw)
+{
+	struct termios *p = &ios, rawios;
+
+	if (raw) {
+		if (tcgetattr(tty, &ios) == -1)
+			return -1;
+		rawios = ios;
+		rawios.c_lflag &= ~(ICANON | ECHO);
+		rawios.c_iflag &= ~(IXON);
+		p = &rawios;
+	}
+	if (tcsetattr(tty, TCSANOW, p) == -1)
+		return -1;
+	return 0;
+}
+
+void
+panic(const char *fmt, ...)
+{
+	static int panicking = 0;
+	va_list ap;
+
+	if (panicking)
+		return;
+	panicking = 1;
+
+	if (tty && tty != -1) {
+		tttidy();
+		ttclose();
+	}
+
+	if (fmt) {
+		va_start(ap, fmt);
+		vfprintf(stderr, fmt, ap);
+		va_end(ap);
+		if (errno)
+			fputs(": ", stderr);
+	}
+	if (errno)
+		fprintf(stderr, strerror(errno));
+	if (fmt || errno)
+		fputc('\n', stderr);
+
+	exit(1);
+}
+
+void
+fini(void)
+{
+	if (tty && tty != -1) {
+		tttidy();
+		ttclose();
+	}
+}
+
+int
+main(void)
+{
+	errno = 0;
+
+	if (ttopen("/dev/tty") == -1)
+		err(1, "/dev/tty");
+	atexit(fini);
 
 	for (;;) {
 		char c;
 		display();
 		if (read(tty, &c, 1) == -1)
-			err(1, "read key");
+			panic("read key");
 		switch (c) {
 		case CTRL('q'): goto end;
 		}
